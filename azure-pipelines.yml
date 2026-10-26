@@ -1,0 +1,155 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  buildConfiguration: 'Release'
+  azureSubscription: 'MyAzureSubscription'          # Troque pelo nome da sua Service Connection
+  apiProject: 'DimDimApi/DimDimApi.csproj'
+  testProject: 'DimDimApi.Tests/DimDimApi.Tests.csproj'
+  artifactName: 'app'
+  WEB_APP_NAME: 'app-dimdim-556460'
+  RESOURCE_GROUP: 'rg-dimdim-556460'
+  # SQL_PASSWORD deve ser criada como variável secreta no Azure DevOps
+
+stages:
+
+# =========================================================
+# 1. CRIAR INFRAESTRUTURA
+# =========================================================
+- stage: Infraestrutura
+  displayName: 'Criar infraestrutura'
+  jobs:
+    - job: CriarInfra
+      displayName: 'Provisionar recursos Azure'
+      pool:
+        vmImage: 'ubuntu-latest'
+
+      steps:
+        - checkout: self
+
+        - task: AzureCLI@2
+          displayName: 'Executar script de infraestrutura'
+          inputs:
+            azureSubscription: '$(azureSubscription)'
+            scriptType: 'bash'
+            scriptLocation: 'scriptPath'
+            scriptPath: 'infra/criar-infra.sh'
+            arguments: '$(SQL_PASSWORD)'
+            workingDirectory: '$(Build.SourcesDirectory)'
+          env:
+            SQL_PASSWORD: $(SQL_PASSWORD)
+
+# =========================================================
+# 2. BUILD, TESTES E PUBLICAÇÃO DO PACOTE
+# =========================================================
+- stage: BuildTestes
+  displayName: 'Build e testes'
+  dependsOn: Infraestrutura
+  condition: succeeded()
+
+  jobs:
+    - job: BuildTest
+      displayName: 'Compilar e testar API'
+      pool:
+        vmImage: 'ubuntu-latest'
+
+      steps:
+        - checkout: self
+
+        - task: UseDotNet@2
+          displayName: 'Instalar .NET 8'
+          inputs:
+            packageType: 'sdk'
+            version: '8.x'
+
+        - task: DotNetCoreCLI@2
+          displayName: 'Restaurar dependências'
+          inputs:
+            command: 'restore'
+            projects: '**/*.csproj'
+
+        - task: DotNetCoreCLI@2
+          displayName: 'Build da API'
+          inputs:
+            command: 'build'
+            projects: '$(apiProject)'
+            arguments: '--configuration $(buildConfiguration)'
+
+        - task: DotNetCoreCLI@2
+          displayName: 'Executar testes unitários'
+          inputs:
+            command: 'test'
+            projects: '$(testProject)'
+            arguments: '--configuration $(buildConfiguration) --logger trx --results-directory $(Agent.TempDirectory)'
+            testRunTitle: 'Testes de Código'
+
+        - task: PublishTestResults@2
+          displayName: 'Publicar resultados dos testes'
+          inputs:
+            testResultsFormat: 'VSTest'
+            testResultsFiles: '$(Agent.TempDirectory)/**/*.trx'
+            mergeTestResults: true
+            failTaskOnFailedTests: true
+
+        - task: DotNetCoreCLI@2
+          displayName: 'Publicar API'
+          inputs:
+            command: 'publish'
+            publishWebProjects: false
+            projects: '$(apiProject)'
+            arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/publish'
+            zipAfterPublish: true
+
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publicar artefato'
+          inputs:
+            targetPath: '$(Build.ArtifactStagingDirectory)'
+            artifact: '$(artifactName)'
+            publishLocation: 'pipeline'
+
+# =========================================================
+# 3. DEPLOY NO AZURE APP SERVICE
+# =========================================================
+- stage: Deploy
+  displayName: 'Deploy no Azure App Service'
+  dependsOn: BuildTestes
+  condition: succeeded()
+
+  jobs:
+    - deployment: DeployWebApp
+      displayName: 'Implantar API'
+      environment: '$(WEB_APP_NAME)'
+      pool:
+        vmImage: 'ubuntu-latest'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - download: current
+                artifact: '$(artifactName)'
+
+              - task: AzureAppServiceSettings@1
+                displayName: 'Configurar variáveis do App Service'
+                inputs:
+                  azureSubscription: '$(azureSubscription)'
+                  appName: '$(WEB_APP_NAME)'
+                  appSettings: |
+                    [
+                      {
+                        "name": "ASPNETCORE_ENVIRONMENT",
+                        "value": "Production",
+                        "slotSetting": false
+                      }
+                    ]
+
+              - task: AzureWebApp@1
+                displayName: 'Deploy da API'
+                inputs:
+                  azureSubscription: '$(azureSubscription)'
+                  appType: 'webAppLinux'
+                  appName: '$(WEB_APP_NAME)'
+                  package: '$(Pipeline.Workspace)/$(artifactName)/**/*.zip'
+                  runtimeStack: 'DOTNETCORE|8.0'
+                  deploymentMethod: 'zipDeploy'
